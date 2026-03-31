@@ -1,0 +1,339 @@
+name: Security Scanning Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Trivy — Docker image vulnerability scan
+  # ──────────────────────────────────────────────
+  trivy-scan:
+    name: "Trivy — Image Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t security-demo:${{ github.sha }} ./examples/docker
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "security-demo:${{ github.sha }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: "trivy"
+
+      - name: Export Trivy JSON for report
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "security-demo:${{ github.sha }}"
+          format: "json"
+          output: "trivy-results.json"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "0"
+
+      - name: Upload Trivy results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-results
+          path: |
+            trivy-results.sarif
+            trivy-results.json
+
+  # ──────────────────────────────────────────────
+  # Job 2: Gitleaks — Secret detection
+  # ──────────────────────────────────────────────
+  gitleaks-scan:
+    name: "Gitleaks — Secret Detection"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: true
+
+      - name: Run Gitleaks (SARIF output)
+        uses: docker://ghcr.io/gitleaks/gitleaks:latest
+        with:
+          args: detect --source=/github/workspace --report-format=sarif --report-path=/github/workspace/gitleaks-results.sarif --exit-code=0
+
+      - name: Run Gitleaks (JSON output)
+        uses: docker://ghcr.io/gitleaks/gitleaks:latest
+        with:
+          args: detect --source=/github/workspace --report-format=json --report-path=/github/workspace/gitleaks-results.json --exit-code=0
+
+      - name: Upload Gitleaks SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "gitleaks-results.sarif"
+          category: "gitleaks"
+
+      - name: Upload Gitleaks results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-results
+          path: |
+            gitleaks-results.sarif
+            gitleaks-results.json
+
+  # ──────────────────────────────────────────────
+  # Job 3: Checkov — IaC security scan
+  # ──────────────────────────────────────────────
+  checkov-scan:
+    name: "Checkov — IaC Security"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov (SARIF)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: examples/terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+      - name: Run Checkov (JSON)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: examples/terraform
+          output_format: json
+          output_file_path: checkov-results.json
+          soft_fail: true
+
+      - name: Upload Checkov SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "checkov-results.sarif"
+          category: "checkov"
+
+      - name: Upload Checkov results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkov-results
+          path: |
+            checkov-results.sarif
+            checkov-results.json
+
+  # ──────────────────────────────────────────────
+  # Job 4: Grype — SBOM & dependency scan
+  # ──────────────────────────────────────────────
+  grype-scan:
+    name: "Grype — Dependency Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t security-demo:${{ github.sha }} ./examples/docker
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: "security-demo:${{ github.sha }}"
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Run Grype vulnerability scan
+        uses: anchore/scan-action@v5
+        id: grype
+        with:
+          sbom: sbom.spdx.json
+          fail-build: false
+          output-format: sarif
+
+      - name: Upload Grype SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+          category: "grype"
+
+      - name: Run Grype (JSON output)
+        uses: anchore/scan-action@v5
+        id: grype-json
+        with:
+          sbom: sbom.spdx.json
+          fail-build: false
+          output-format: json
+
+      - name: Upload Grype results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grype-results
+          path: |
+            ${{ steps.grype.outputs.sarif }}
+            ${{ steps.grype-json.outputs.json }}
+            sbom.spdx.json
+
+  # ──────────────────────────────────────────────
+  # Job 5: Generate unified report
+  # ──────────────────────────────────────────────
+  generate-report:
+    name: "Generate Unified Report"
+    runs-on: ubuntu-latest
+    needs: [trivy-scan, gitleaks-scan, checkov-scan, grype-scan]
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-results
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install jinja2
+
+      - name: Generate unified HTML report
+        run: |
+          python scripts/report_generator.py \
+            --trivy-sarif scan-results/trivy-results/trivy-results.sarif \
+            --gitleaks-sarif scan-results/gitleaks-results/gitleaks-results.sarif \
+            --checkov-sarif scan-results/checkov-results/checkov-results.sarif \
+            --grype-sarif scan-results/grype-results/results.sarif \
+            --output report/security-report.html
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: report/security-report.html
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Read summary from report generator
+            let summary = '## Security Scan Summary\n\n';
+            try {
+              const data = fs.readFileSync('report/summary.json', 'utf8');
+              const report = JSON.parse(data);
+              summary += `| Scanner | Critical | High | Medium | Low |\n`;
+              summary += `|---------|----------|------|--------|-----|\n`;
+              for (const [scanner, counts] of Object.entries(report.scanners)) {
+                summary += `| ${scanner} | ${counts.critical} | ${counts.high} | ${counts.medium} | ${counts.low} |\n`;
+              }
+              summary += `\n**Overall Score:** ${report.score}/100\n`;
+              summary += `\n${report.verdict}\n`;
+            } catch (e) {
+              summary += '_Report generation encountered issues. Check the workflow artifacts for details._\n';
+            }
+
+            summary += '\n> Full report available in workflow artifacts.';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+  # ──────────────────────────────────────────────
+  # Job 6: Policy gate — block merge if critical
+  # ──────────────────────────────────────────────
+  policy-gate:
+    name: "Policy Gate"
+    runs-on: ubuntu-latest
+    needs: [trivy-scan, gitleaks-scan, checkov-scan, grype-scan]
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-results
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run policy checks
+        id: policy
+        run: |
+          python scripts/policy_check.py \
+            --trivy-sarif scan-results/trivy-results/trivy-results.sarif \
+            --gitleaks-sarif scan-results/gitleaks-results/gitleaks-results.sarif \
+            --checkov-sarif scan-results/checkov-results/checkov-results.sarif \
+            --grype-sarif scan-results/grype-results/results.sarif
+
+      - name: Label PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let passed = true;
+            try {
+              const data = fs.readFileSync('policy-result.json', 'utf8');
+              passed = JSON.parse(data).passed;
+            } catch (e) {
+              passed = false;
+            }
+
+            const label = passed ? 'security-passed' : 'security-blocked';
+            const removeLabel = passed ? 'security-blocked' : 'security-passed';
+
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: removeLabel
+              });
+            } catch (e) { /* label might not exist */ }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [label]
+            });
